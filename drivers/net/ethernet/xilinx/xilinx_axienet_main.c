@@ -1770,66 +1770,75 @@ static int axienet_recv(struct net_device *ndev, int budget,
 			else
 				length = cur_p->app4 & 0x0000FFFF;
 
-			skb_put(skb, length);
+
+			if (unlikely(length > skb_tailroom(skb))) {
+				netdev_warn(ndev,
+					"Dropping oversized RX frame (len=%u, tailroom=%u)\n",
+					length, skb_tailroom(skb));
+				dev_kfree_skb(skb);
+				skb = NULL;
+			}else{
+				skb_put(skb, length);
 
 #ifdef CONFIG_XILINX_AXI_EMAC_HWTSTAMP
-			if ((lp->tstamp_config.rx_filter == HWTSTAMP_FILTER_ALL ||
-			     lp->eth_hasptp) &&
-			    lp->axienet_config->mactype != XAXIENET_10G_25G &&
-			    lp->axienet_config->mactype != XAXIENET_MRMAC) {
-				u32 sec, nsec;
-				u64 time64;
-				struct skb_shared_hwtstamps *shhwtstamps;
+				if ((lp->tstamp_config.rx_filter == HWTSTAMP_FILTER_ALL ||
+					lp->eth_hasptp) &&
+					lp->axienet_config->mactype != XAXIENET_10G_25G &&
+					lp->axienet_config->mactype != XAXIENET_MRMAC) {
+					u32 sec, nsec;
+					u64 time64;
+					struct skb_shared_hwtstamps *shhwtstamps;
 
-				if (lp->axienet_config->mactype == XAXIENET_1_2p5G) {
-					/* The first 8 bytes will be the timestamp */
-					memcpy(&sec, &skb->data[0], 4);
-					memcpy(&nsec, &skb->data[4], 4);
+					if (lp->axienet_config->mactype == XAXIENET_1_2p5G) {
+						/* The first 8 bytes will be the timestamp */
+						memcpy(&sec, &skb->data[0], 4);
+						memcpy(&nsec, &skb->data[4], 4);
 
-					sec = cpu_to_be32(sec);
-					nsec = cpu_to_be32(nsec);
-				} else {
-					/* The first 8 bytes will be the timestamp */
-					memcpy(&nsec, &skb->data[0], 4);
-					memcpy(&sec, &skb->data[4], 4);
+						sec = cpu_to_be32(sec);
+						nsec = cpu_to_be32(nsec);
+					} else {
+						/* The first 8 bytes will be the timestamp */
+						memcpy(&nsec, &skb->data[0], 4);
+						memcpy(&sec, &skb->data[4], 4);
+					}
+
+					/* Remove these 8 bytes from the buffer */
+					skb_pull(skb, 8);
+					time64 = sec * NS_PER_SEC + nsec;
+					shhwtstamps = skb_hwtstamps(skb);
+					shhwtstamps->hwtstamp = ns_to_ktime(time64);
+				} else if (lp->axienet_config->mactype == XAXIENET_10G_25G ||
+					lp->axienet_config->mactype == XAXIENET_MRMAC) {
+					axienet_rx_hwtstamp(lp, skb);
 				}
-
-				/* Remove these 8 bytes from the buffer */
-				skb_pull(skb, 8);
-				time64 = sec * NS_PER_SEC + nsec;
-				shhwtstamps = skb_hwtstamps(skb);
-				shhwtstamps->hwtstamp = ns_to_ktime(time64);
-			} else if (lp->axienet_config->mactype == XAXIENET_10G_25G ||
-				   lp->axienet_config->mactype == XAXIENET_MRMAC) {
-				axienet_rx_hwtstamp(lp, skb);
-			}
 #endif
-			skb->protocol = eth_type_trans(skb, ndev);
-			/*skb_checksum_none_assert(skb);*/
-			skb->ip_summed = CHECKSUM_NONE;
+				skb->protocol = eth_type_trans(skb, ndev);
+				/*skb_checksum_none_assert(skb);*/
+				skb->ip_summed = CHECKSUM_NONE;
 
-			/* if we're doing Rx csum offload, set it up */
-			if (lp->features & XAE_FEATURE_FULL_RX_CSUM &&
-			    lp->axienet_config->mactype == XAXIENET_1_2p5G &&
-			    !lp->eth_hasnobuf) {
-				csumstatus = (cur_p->app2 &
-					      XAE_FULL_CSUM_STATUS_MASK) >> 3;
-				if (csumstatus == XAE_IP_TCP_CSUM_VALIDATED ||
-				    csumstatus == XAE_IP_UDP_CSUM_VALIDATED) {
-					skb->ip_summed = CHECKSUM_UNNECESSARY;
+				/* if we're doing Rx csum offload, set it up */
+				if (lp->features & XAE_FEATURE_FULL_RX_CSUM &&
+					lp->axienet_config->mactype == XAXIENET_1_2p5G &&
+					!lp->eth_hasnobuf) {
+					csumstatus = (cur_p->app2 &
+							XAE_FULL_CSUM_STATUS_MASK) >> 3;
+					if (csumstatus == XAE_IP_TCP_CSUM_VALIDATED ||
+						csumstatus == XAE_IP_UDP_CSUM_VALIDATED) {
+						skb->ip_summed = CHECKSUM_UNNECESSARY;
+					}
+				} else if ((lp->features & XAE_FEATURE_PARTIAL_RX_CSUM) != 0 &&
+					skb->protocol == htons(ETH_P_IP) &&
+					skb->len > 64 && !lp->eth_hasnobuf &&
+					lp->axienet_config->mactype == XAXIENET_1_2p5G) {
+					skb->csum = be32_to_cpu(cur_p->app3 & 0xFFFF);
+					skb->ip_summed = CHECKSUM_COMPLETE;
 				}
-			} else if ((lp->features & XAE_FEATURE_PARTIAL_RX_CSUM) != 0 &&
-				   skb->protocol == htons(ETH_P_IP) &&
-				   skb->len > 64 && !lp->eth_hasnobuf &&
-				   lp->axienet_config->mactype == XAXIENET_1_2p5G) {
-				skb->csum = be32_to_cpu(cur_p->app3 & 0xFFFF);
-				skb->ip_summed = CHECKSUM_COMPLETE;
+
+				netif_receive_skb(skb);
+
+				size += length;
+				packets++;
 			}
-
-		netif_receive_skb(skb);
-
-			size += length;
-			packets++;
 		}
 
 		/* Ensure that the skb is completely updated
